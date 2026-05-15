@@ -199,6 +199,29 @@ describe('http adapter', () => {
       expect(content).toEqual({ text: 'ping the team', sender: 'http', senderId: 'http:client' });
     });
 
+    it('uses as_user as the senderId when provided', async () => {
+      const { status } = await req(
+        port,
+        'POST',
+        '/message',
+        JSON.stringify({
+          text: 'as the operator',
+          reply_to_group: 'discord/X',
+          as_user: 'discord:121691874942517251',
+        }),
+        authHeaders(),
+      );
+      expect(status).toBe(202);
+      await new Promise((r) => setImmediate(r));
+      const event = onInboundEvent.mock.calls[0]![0] as InboundEvent;
+      const content = JSON.parse(event.message.content);
+      expect(content).toEqual({
+        text: 'as the operator',
+        sender: 'http',
+        senderId: 'discord:121691874942517251',
+      });
+    });
+
     it('returns 400 for invalid JSON', async () => {
       const { status } = await req(port, 'POST', '/message', 'not-json', authHeaders());
       expect(status).toBe(400);
@@ -264,5 +287,261 @@ describe('http adapter', () => {
       const result = await adapter.deliver('anything', null, { kind: 'chat', content: { text: 'x' } });
       expect(result).toBeUndefined();
     });
+  });
+});
+
+/**
+ * /transcribe needs a configurable upstream URL, so these tests bring their
+ * own adapter (with `transcribeUrl` overridden) instead of reusing the
+ * top-level `beforeEach` fixture. A stub whisper server runs on a separate
+ * port and is wired in via the adapter options.
+ */
+describe('http adapter — POST /transcribe', () => {
+  const TOKEN = 'transcribe-token';
+
+  let adapter: ChannelAdapter | null = null;
+  let port: number;
+  let whisper: http.Server | null = null;
+  let whisperPort: number;
+  let lastWhisperRequest: { contentLength: number; bodyHead: string } | null = null;
+
+  beforeEach(async () => {
+    port = await getFreePort();
+    whisperPort = await getFreePort();
+    lastWhisperRequest = null;
+  });
+
+  afterEach(async () => {
+    if (adapter && adapter.isConnected()) await adapter.teardown();
+    adapter = null;
+    if (whisper) {
+      await new Promise<void>((resolve) => whisper!.close(() => resolve()));
+      whisper = null;
+    }
+  });
+
+  /** Start a stub whisper server that always responds with the given JSON for /v1/audio/transcriptions. */
+  async function startWhisper(response: { status?: number; body?: unknown } = {}): Promise<string> {
+    const status = response.status ?? 200;
+    const body = response.body ?? { text: 'stub transcription' };
+    whisper = http.createServer((req, res) => {
+      // Capture the incoming request shape for assertions.
+      let received = 0;
+      const head: Buffer[] = [];
+      req.on('data', (chunk: Buffer) => {
+        received += chunk.length;
+        if (head.length < 4) head.push(chunk);
+      });
+      req.on('end', () => {
+        lastWhisperRequest = {
+          contentLength: received,
+          bodyHead: Buffer.concat(head).slice(0, 200).toString('binary'),
+        };
+        if (status >= 400) {
+          res.writeHead(status, { 'Content-Type': 'text/plain' }).end('upstream error');
+        } else {
+          res.writeHead(status, { 'Content-Type': 'application/json' }).end(JSON.stringify(body));
+        }
+      });
+    });
+    await new Promise<void>((resolve, reject) => {
+      whisper!.once('error', reject);
+      whisper!.listen(whisperPort, '127.0.0.1', () => resolve());
+    });
+    return `http://127.0.0.1:${whisperPort}/v1/audio/transcriptions`;
+  }
+
+  async function bootAdapter(
+    transcribeUrl: string | undefined,
+    overrides: Partial<ChannelSetup> = {},
+  ): Promise<ChannelSetup['onInboundEvent'] & { mock: { calls: unknown[][] } }> {
+    adapter = createHttpAdapter({ port, authToken: TOKEN, transcribeUrl });
+    const onInboundEvent = vi.fn() as unknown as ChannelSetup['onInboundEvent'] & { mock: { calls: unknown[][] } };
+    await adapter.setup(makeSetup({ onInboundEvent, ...overrides }));
+    return onInboundEvent;
+  }
+
+  /** POST with a Buffer body (e.g. raw audio). */
+  async function postBinary(
+    path: string,
+    body: Buffer,
+    headers: Record<string, string> = {},
+  ): Promise<{ status: number; data: unknown }> {
+    return new Promise((resolve, reject) => {
+      const request = http.request(
+        {
+          host: '127.0.0.1',
+          port,
+          method: 'POST',
+          path,
+          headers: { 'Content-Type': 'audio/wav', 'Content-Length': String(body.length), ...headers },
+        },
+        (res) => {
+          let raw = '';
+          res.on('data', (chunk: Buffer) => (raw += chunk.toString()));
+          res.on('end', () => {
+            try {
+              resolve({ status: res.statusCode!, data: JSON.parse(raw) });
+            } catch {
+              resolve({ status: res.statusCode!, data: raw });
+            }
+          });
+        },
+      );
+      request.on('error', reject);
+      request.write(body);
+      request.end();
+    });
+  }
+
+  const TINY_WAV = Buffer.from('RIFF\x24\x00\x00\x00WAVEfmt placeholder', 'binary');
+
+  it('rejects requests with no auth header (401)', async () => {
+    const url = await startWhisper();
+    const onInboundEvent = await bootAdapter(url);
+    const { status } = await postBinary('/transcribe?reply_to_group=discord/X&as_user=u', TINY_WAV);
+    expect(status).toBe(401);
+    expect(onInboundEvent).not.toHaveBeenCalled();
+    expect(lastWhisperRequest).toBeNull();
+  });
+
+  it('rejects missing reply_to_group (400)', async () => {
+    const url = await startWhisper();
+    const onInboundEvent = await bootAdapter(url);
+    const { status } = await postBinary('/transcribe?as_user=u', TINY_WAV, {
+      Authorization: `Bearer ${TOKEN}`,
+    });
+    expect(status).toBe(400);
+    expect(onInboundEvent).not.toHaveBeenCalled();
+    expect(lastWhisperRequest).toBeNull();
+  });
+
+  it('rejects malformed reply_to_group (400)', async () => {
+    const url = await startWhisper();
+    await bootAdapter(url);
+    const { status } = await postBinary('/transcribe?reply_to_group=no-slash&as_user=u', TINY_WAV, {
+      Authorization: `Bearer ${TOKEN}`,
+    });
+    expect(status).toBe(400);
+  });
+
+  it('rejects empty body (400)', async () => {
+    const url = await startWhisper();
+    await bootAdapter(url);
+    const { status } = await postBinary('/transcribe?reply_to_group=discord/X&as_user=u', Buffer.alloc(0), {
+      Authorization: `Bearer ${TOKEN}`,
+    });
+    expect(status).toBe(400);
+  });
+
+  it('returns 200, transcribes, and dispatches onInboundEvent', async () => {
+    const url = await startWhisper({ body: { text: 'hello from whisper' } });
+    const onInboundEvent = await bootAdapter(url);
+
+    const { status, data } = await postBinary(
+      '/transcribe?reply_to_group=discord/discord:@me:42&as_user=discord:owner',
+      TINY_WAV,
+      { Authorization: `Bearer ${TOKEN}` },
+    );
+
+    expect(status).toBe(200);
+    expect(data).toMatchObject({
+      text: 'hello from whisper',
+      routedTo: { channelType: 'discord', platformId: 'discord:@me:42' },
+    });
+    expect((data as { messageId: string }).messageId).toMatch(/^http-/);
+
+    // Whisper actually received the audio bytes as multipart form-data.
+    expect(lastWhisperRequest).not.toBeNull();
+    expect(lastWhisperRequest!.contentLength).toBeGreaterThan(TINY_WAV.length);
+    expect(lastWhisperRequest!.bodyHead).toContain('Content-Disposition');
+    expect(lastWhisperRequest!.bodyHead).toContain('name="file"');
+  });
+
+  it('dispatches with the transcribed text as message content', async () => {
+    const url = await startWhisper({ body: { text: 'route this please' } });
+    const onInboundEvent = await bootAdapter(url);
+
+    await postBinary(
+      '/transcribe?reply_to_group=discord/dm-1&as_user=discord:owner',
+      TINY_WAV,
+      { Authorization: `Bearer ${TOKEN}` },
+    );
+
+    // wait for the fire-and-forget dispatch
+    await new Promise((r) => setImmediate(r));
+
+    expect(onInboundEvent).toHaveBeenCalledOnce();
+    const event = onInboundEvent.mock.calls[0]![0] as InboundEvent;
+    expect(event.channelType).toBe('discord');
+    expect(event.platformId).toBe('dm-1');
+    const content = JSON.parse(event.message.content);
+    expect(content).toEqual({ text: 'route this please', sender: 'http', senderId: 'discord:owner' });
+  });
+
+  it('defaults as_user to http:client when query param missing', async () => {
+    const url = await startWhisper({ body: { text: 'no asuser' } });
+    const onInboundEvent = await bootAdapter(url);
+    await postBinary('/transcribe?reply_to_group=discord/X', TINY_WAV, {
+      Authorization: `Bearer ${TOKEN}`,
+    });
+    await new Promise((r) => setImmediate(r));
+    const event = onInboundEvent.mock.calls[0]![0] as InboundEvent;
+    expect(JSON.parse(event.message.content)).toMatchObject({ senderId: 'http:client' });
+  });
+
+  it('does NOT dispatch on empty transcription', async () => {
+    const url = await startWhisper({ body: { text: '   ' } });
+    const onInboundEvent = await bootAdapter(url);
+
+    const { status, data } = await postBinary(
+      '/transcribe?reply_to_group=discord/X&as_user=u',
+      TINY_WAV,
+      { Authorization: `Bearer ${TOKEN}` },
+    );
+    expect(status).toBe(200);
+    expect(data).toMatchObject({ text: '', messageId: null, routedTo: null });
+    await new Promise((r) => setImmediate(r));
+    expect(onInboundEvent).not.toHaveBeenCalled();
+  });
+
+  it('returns 502 when whisper returns a non-2xx', async () => {
+    const url = await startWhisper({ status: 500, body: 'boom' });
+    const onInboundEvent = await bootAdapter(url);
+
+    const { status, data } = await postBinary(
+      '/transcribe?reply_to_group=discord/X&as_user=u',
+      TINY_WAV,
+      { Authorization: `Bearer ${TOKEN}` },
+    );
+    expect(status).toBe(502);
+    expect(data).toMatchObject({ error: expect.stringContaining('500') });
+    expect(onInboundEvent).not.toHaveBeenCalled();
+  });
+
+  it('returns 502 when whisper is unreachable', async () => {
+    // Boot adapter with an unused port — no upstream listening.
+    const unreachable = `http://127.0.0.1:${whisperPort}/v1/audio/transcriptions`;
+    const onInboundEvent = await bootAdapter(unreachable);
+
+    const { status } = await postBinary(
+      '/transcribe?reply_to_group=discord/X&as_user=u',
+      TINY_WAV,
+      { Authorization: `Bearer ${TOKEN}` },
+    );
+    expect(status).toBe(502);
+    expect(onInboundEvent).not.toHaveBeenCalled();
+  });
+
+  it('returns 503 when transcribeUrl is explicitly empty', async () => {
+    const onInboundEvent = await bootAdapter('');
+    const { status, data } = await postBinary(
+      '/transcribe?reply_to_group=discord/X&as_user=u',
+      TINY_WAV,
+      { Authorization: `Bearer ${TOKEN}` },
+    );
+    expect(status).toBe(503);
+    expect(data).toMatchObject({ error: expect.stringContaining('not configured') });
+    expect(onInboundEvent).not.toHaveBeenCalled();
   });
 });
